@@ -74,6 +74,50 @@ A cold-outreach agent that personalizes the first touch, follows up after 4 days
 | `prospects.py` | CSV-backed prospect tracker + `gtm_log.csv` audit log helpers. |
 | `prospects.example.csv` | Schema reference + sample rows. |
 | `.env.example` | Copy to `.env`. |
+| `leadgen.py` + `leadgen/` | **Generate** prospects from a product URL via GitHub + Hacker News. Writes draft rows for review. |
+
+## Generating prospects automatically (dev-tool focus)
+
+`leadgen.py` turns your product URL into draft `prospects.csv` rows by sourcing
+developers from GitHub and enriching with Hacker News context.
+
+Five-stage pipeline:
+
+1. **Profile** your product (scrape landing page → structured profile via Claude).
+2. **Synthesize ICP** (profile → GitHub topics + seed repos to mine).
+3. **Source orgs** on GitHub via topic search, dependent-repo search, or stargazers of a seed repo.
+4. **Enrich + hook** — pick the most active contributor with a public email, look up the org on HN, generate a one-line factual hook.
+5. **Write** rows with `status=draft` so the sending loop ignores them until you promote to `queued`.
+
+Setup:
+
+```bash
+# Add to .env (read-only is enough; lifts you from 60 to 5000 GitHub req/h)
+GITHUB_TOKEN=ghp_...
+```
+
+Run:
+
+```bash
+# Auto: Claude picks GitHub topics from your URL
+python leadgen.py --url https://yourtool.dev
+
+# Manual override of discovery
+python leadgen.py --url https://yourtool.dev \
+    --topics ai-agents llm-agent \
+    --stargazers-of langchain-ai/langgraph \
+    --max 15
+
+# Preview without touching the CSV
+python leadgen.py --url https://yourtool.dev --dry-run --verbose
+```
+
+Hard rules baked into leadgen:
+
+- **Public emails only.** GitHub `noreply` addresses are skipped; if no contributor on a repo has a real public email we drop the org.
+- **Org-grain.** One champion per org by default (skip personal accounts; opt in with `--include-personal`).
+- **Drafts.** New rows are written with `status=draft`. Open `prospects.csv`, sanity-check the hook, change `draft` → `queued`. The agent only sends when `status` is empty or `queued`.
+- **HN is enrichment, not discovery.** We look up the prospect's company/domain on HN to feed the hook generator extra context; we do not scrape "Show HN" as a lead source in this version.
 
 ## Customize
 

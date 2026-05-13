@@ -228,7 +228,7 @@ def send_first_touch(prospect: dict, inbox) -> None:
     thread_id = getattr(sent, "thread_id", None) or getattr(sent, "message_id", "")
     prospects.update_prospect(
         prospect["email"],
-        status="first_touch_sent",
+        status="first_touch_sent",      
         first_touch_at=_now_iso(),
         thread_id=thread_id,
     )

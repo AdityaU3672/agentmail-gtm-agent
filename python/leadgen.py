@@ -28,7 +28,6 @@ import json
 import sys
 import time
 from dataclasses import asdict
-from urllib.parse import urlparse
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -65,6 +64,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                    help="Print leads to stdout instead of writing prospects.csv.")
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument(
+        "--github-parallel",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Concurrent GitHub org resolutions (default: env LEADGEN_GITHUB_PARALLEL or 5). "
+            "Use 1 for fully sequential, easier logs. Higher = faster but more 429 risk."
+        ),
+    )
     return p.parse_args()
 
 
@@ -76,6 +85,9 @@ def main() -> int:
     cfg.min_repo_stars = args.min_stars
     cfg.require_recent_push_days = args.recent_days
     cfg.skip_personal_accounts = not args.include_personal
+    cfg.verbose = args.verbose
+    if args.github_parallel is not None:
+        cfg.github_parallel_workers = max(1, args.github_parallel)
 
     claude = Anthropic(api_key=cfg.anthropic_api_key)
 
@@ -104,6 +116,8 @@ def main() -> int:
 
     if not cfg.github_token:
         print("      ! GITHUB_TOKEN not set — running unauthenticated (60 req/h cap).")
+    if cfg.github_parallel_workers > 1:
+        print(f"      GitHub parallel workers: {cfg.github_parallel_workers}")
 
     # --- Stage 3: GitHub discovery + champion selection --------------------
     print("[3/5] discovering orgs on GitHub ...")

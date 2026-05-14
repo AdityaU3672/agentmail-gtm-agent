@@ -26,6 +26,13 @@ class LeadGenConfig:
     skip_personal_accounts: bool = True
     sleep_between_calls_s: float = 0.25
 
+    # Resolve orgs in parallel (asyncio + thread offload for sync urllib).
+    # GitHub still enforces a global rate budget — keep modest (default 5).
+    github_parallel_workers: int = 5
+
+    # Extra discovery detail when True.
+    verbose: bool = False
+
     # Discovery sources to try (any subset of: topic, dependents, stargazers).
     sources: list[str] = field(default_factory=lambda: ["topic"])
 
@@ -39,8 +46,15 @@ class LeadGenConfig:
         key = os.environ.get("ANTHROPIC_API_KEY")
         if not key:
             raise SystemExit("ANTHROPIC_API_KEY required (see python/.env.example).")
+        parallel_raw = os.getenv("LEADGEN_GITHUB_PARALLEL", "5").strip()
+        try:
+            github_parallel_workers = max(1, int(parallel_raw or "5"))
+        except ValueError:
+            github_parallel_workers = 5
+
         return cls(
             anthropic_api_key=key,
             anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
             github_token=os.getenv("GITHUB_TOKEN"),
+            github_parallel_workers=github_parallel_workers,
         )

@@ -110,7 +110,12 @@ python leadgen.py --url https://yourtool.dev \
 
 # Preview without touching the CSV
 python leadgen.py --url https://yourtool.dev --dry-run --verbose
+
+# Stage 3 prints discovery + per-org progress. Fully sequential GitHub calls:
+python leadgen.py --url https://yourtool.dev --github-parallel 1
 ```
+
+Stage 3 logs each topic/dependent/stargazer search, then each org resolution. By default it resolves orgs in **parallel** (bounded concurrency over a **single aiohttp `ClientSession`**, capped at **5** workers — override with `LEADGEN_GITHUB_PARALLEL` or `--github-parallel N`). That keeps TLS + connection pooling in one place; GitHub’s **hourly rate limit is unchanged**, so very high concurrency can increase **429** retries.
 
 Hard rules baked into leadgen:
 

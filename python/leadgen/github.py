@@ -1,27 +1,20 @@
-"""Stage 3 — GitHub discovery + champion picking.
+"""Stage 3 — GitHub discovery + champion picking (aiohttp, one shared session).
 
-Three discovery modes (combine freely):
-  - topic       : repos tagged with a topic (proxies "building in this space")
-  - stargazers  : users who starred / forked a seed repo (proxies "interested in this stack")
-  - dependents  : repos depending on a seed package (intent: already using it)
-                  GitHub's dependents view has no public REST API, so we approximate
-                  by code-searching for import statements of the seed repo's package
-                  name. It's a heuristic, not a complete list.
-
-Per-org champion selection:
-  We look at top contributors of the matched repo, then for each one fetch their
-  public profile + recent commits to extract a real email (skipping noreply.github.com).
-  If we can't find one for any contributor, the org is skipped (per public-only policy).
+Discovery modes: topic, stargazers, dependents (code search heuristic).
+Champion: top contributors with a public email (no noreply.github.com).
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
+import aiohttp
+
 from .config import LeadGenConfig
-from .http import get_json
+from .http import aget_json, make_aiohttp_connector
 
 
 GITHUB_API = "https://api.github.com"
@@ -30,12 +23,12 @@ NOREPLY_RE = re.compile(r"@users\.noreply\.github\.com$", re.IGNORECASE)
 
 @dataclass
 class RepoSignal:
-    full_name: str           # "owner/repo"
+    full_name: str
     description: str
     stars: int
     language: str
     pushed_at: str
-    homepage: str            # often the org's marketing URL — useful for HN lookup
+    homepage: str
     topics: list[str] = field(default_factory=list)
 
 
@@ -44,7 +37,7 @@ class Champion:
     login: str
     name: str
     email: str
-    role: str                # heuristic from bio / GitHub bio + repo role
+    role: str
     company: str
     company_domain: str
     blog_url: str
@@ -53,14 +46,9 @@ class Champion:
 
 @dataclass
 class OrgLead:
-    org_login: str           # GitHub org/user that owns the matched repo
+    org_login: str
     repo: RepoSignal
     champion: Champion
-
-
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
 
 
 def _headers(cfg: LeadGenConfig) -> dict[str, str]:
@@ -74,47 +62,50 @@ def _headers(cfg: LeadGenConfig) -> dict[str, str]:
     return h
 
 
-def _gh(cfg: LeadGenConfig, path: str, **params) -> object:
-    return get_json(
+async def _gh(
+    session: aiohttp.ClientSession,
+    cfg: LeadGenConfig,
+    path: str,
+    **params: object,
+) -> object:
+    return await aget_json(
+        session,
         f"{GITHUB_API}{path}",
-        headers=_headers(cfg),
-        params=params or None,
+        params={k: v for k, v in params.items() if v is not None},
         timeout_s=cfg.request_timeout_s,
     )
 
 
-# ---------------------------------------------------------------------------
-# Discovery
-# ---------------------------------------------------------------------------
+# --- discovery --------------------------------------------------------------
 
 
-def search_by_topic(cfg: LeadGenConfig, topic: str) -> list[RepoSignal]:
-    """Search repos tagged with `topic`, sorted by stars desc."""
+async def search_by_topic(
+    session: aiohttp.ClientSession, cfg: LeadGenConfig, topic: str,
+) -> list[RepoSignal]:
     q = f"topic:{topic} stars:>={cfg.min_repo_stars} pushed:>={_recent_iso(cfg.require_recent_push_days)}"
-    data = _gh(cfg, "/search/repositories", q=q, sort="stars", order="desc",
-               per_page=min(cfg.max_orgs_per_query * 2, 100))
+    data = await _gh(
+        session, cfg, "/search/repositories",
+        q=q, sort="stars", order="desc",
+        per_page=min(cfg.max_orgs_per_query * 2, 100),
+    )
     return [_repo_from(item) for item in (data.get("items") or [])]
 
 
-def search_stargazers_seed(cfg: LeadGenConfig, seed_repo: str) -> list[str]:
-    """Return logins of users who recently starred `owner/repo`. Capped by config.
-
-    Returned logins are *individual users*, not orgs. We then look at their
-    public repos to find an org affiliation.
-    """
-    data = _gh(cfg, f"/repos/{seed_repo}/stargazers",
-               per_page=min(cfg.max_orgs_per_query, 100))
+async def search_stargazers_seed(
+    session: aiohttp.ClientSession, cfg: LeadGenConfig, seed_repo: str,
+) -> list[str]:
+    data = await _gh(
+        session, cfg, f"/repos/{seed_repo}/stargazers",
+        per_page=min(cfg.max_orgs_per_query, 100),
+    )
     if not isinstance(data, list):
         return []
     return [u["login"] for u in data if isinstance(u, dict) and u.get("type") == "User"]
 
 
-def search_dependents_via_code(cfg: LeadGenConfig, seed_repo: str) -> list[RepoSignal]:
-    """Approximate dependents via code search for the package name.
-
-    GitHub's official dependents graph isn't in the REST API. We code-search
-    for import lines, which catches the common case for npm/PyPI/Go modules.
-    """
+async def search_dependents_via_code(
+    session: aiohttp.ClientSession, cfg: LeadGenConfig, seed_repo: str,
+) -> list[RepoSignal]:
     package = seed_repo.split("/")[-1]
     queries = [
         f'"from {package}" language:python',
@@ -124,7 +115,7 @@ def search_dependents_via_code(cfg: LeadGenConfig, seed_repo: str) -> list[RepoS
     found: dict[str, RepoSignal] = {}
     for q in queries:
         try:
-            data = _gh(cfg, "/search/code", q=q, per_page=30)
+            data = await _gh(session, cfg, "/search/code", q=q, per_page=30)
         except Exception:
             continue
         for item in (data.get("items") or []):
@@ -146,15 +137,34 @@ def search_dependents_via_code(cfg: LeadGenConfig, seed_repo: str) -> list[RepoS
     return list(found.values())
 
 
-# ---------------------------------------------------------------------------
-# Champion selection
-# ---------------------------------------------------------------------------
+# --- champion ---------------------------------------------------------------
 
 
-def pick_champion(cfg: LeadGenConfig, repo: RepoSignal) -> Champion | None:
-    """Find a public-email-bearing contributor for the org owning this repo."""
+async def _email_from_recent_commits(
+    session: aiohttp.ClientSession, cfg: LeadGenConfig, login: str,
+) -> str:
     try:
-        contributors = _gh(cfg, f"/repos/{repo.full_name}/contributors", per_page=10)
+        events = await _gh(session, cfg, f"/users/{login}/events/public", per_page=30)
+    except Exception:
+        return ""
+    if not isinstance(events, list):
+        return ""
+    for ev in events:
+        if ev.get("type") != "PushEvent":
+            continue
+        for commit in (ev.get("payload", {}).get("commits") or []):
+            author = commit.get("author") or {}
+            email = (author.get("email") or "").strip()
+            if email and not NOREPLY_RE.search(email):
+                return email
+    return ""
+
+
+async def pick_champion(
+    session: aiohttp.ClientSession, cfg: LeadGenConfig, repo: RepoSignal,
+) -> Champion | None:
+    try:
+        contributors = await _gh(session, cfg, f"/repos/{repo.full_name}/contributors", per_page=10)
     except Exception:
         return None
     if not isinstance(contributors, list):
@@ -165,13 +175,13 @@ def pick_champion(cfg: LeadGenConfig, repo: RepoSignal) -> Champion | None:
         if not login or c.get("type") != "User":
             continue
         try:
-            user = _gh(cfg, f"/users/{login}")
+            user = await _gh(session, cfg, f"/users/{login}")
         except Exception:
             continue
 
         email = (user.get("email") or "").strip()
         if not email:
-            email = _email_from_recent_commits(cfg, login)
+            email = await _email_from_recent_commits(session, cfg, login)
         if not email or NOREPLY_RE.search(email):
             continue
 
@@ -189,69 +199,168 @@ def pick_champion(cfg: LeadGenConfig, repo: RepoSignal) -> Champion | None:
     return None
 
 
-def _email_from_recent_commits(cfg: LeadGenConfig, login: str) -> str:
-    """Scan a user's recent push events for a non-noreply commit email."""
+async def _is_org(session: aiohttp.ClientSession, cfg: LeadGenConfig, login: str) -> bool:
     try:
-        events = _gh(cfg, f"/users/{login}/events/public", per_page=30)
+        u = await _gh(session, cfg, f"/users/{login}")
     except Exception:
-        return ""
-    if not isinstance(events, list):
-        return ""
-    for ev in events:
-        if ev.get("type") != "PushEvent":
-            continue
-        for commit in (ev.get("payload", {}).get("commits") or []):
-            author = commit.get("author") or {}
-            email = (author.get("email") or "").strip()
-            if email and not NOREPLY_RE.search(email):
-                return email
-    return ""
+        return False
+    return u.get("type") == "Organization"
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
+async def _user_top_repo(
+    session: aiohttp.ClientSession, cfg: LeadGenConfig, login: str,
+) -> RepoSignal | None:
+    try:
+        repos = await _gh(session, cfg, f"/users/{login}/repos", sort="updated", per_page=10)
+    except Exception:
+        return None
+    if not isinstance(repos, list) or not repos:
+        return None
+    repos.sort(key=lambda r: int(r.get("stargazers_count") or 0), reverse=True)
+    return _repo_from(repos[0])
 
 
-def collect_org_leads(cfg: LeadGenConfig) -> list[OrgLead]:
-    """Run the configured discovery sources and return deduped OrgLead rows."""
-    repos: dict[str, RepoSignal] = {}
+# --- orchestration ----------------------------------------------------------
 
-    if "topic" in cfg.sources:
-        for topic in cfg.topics:
-            for r in search_by_topic(cfg, topic):
-                repos.setdefault(r.full_name, r)
 
-    if "dependents" in cfg.sources:
-        for seed in cfg.dependents_of:
-            for r in search_dependents_via_code(cfg, seed):
-                repos.setdefault(r.full_name, r)
+async def _try_org_lead(
+    session: aiohttp.ClientSession, cfg: LeadGenConfig, repo: RepoSignal,
+) -> OrgLead | None:
+    owner = repo.full_name.split("/")[0]
+    if cfg.skip_personal_accounts and not await _is_org(session, cfg, owner):
+        return None
+    champ = await pick_champion(session, cfg, repo)
+    if not champ:
+        return None
+    return OrgLead(org_login=owner, repo=repo, champion=champ)
 
-    if "stargazers" in cfg.sources:
-        # Stargazers give us users; resolve them to their most-starred org repo.
-        for seed in cfg.stargazers_of:
-            for login in search_stargazers_seed(cfg, seed):
-                top = _user_top_repo(cfg, login)
-                if top:
-                    repos.setdefault(top.full_name, top)
 
+async def _collect_sequential_async(
+    session: aiohttp.ClientSession, cfg: LeadGenConfig, deduped: list[RepoSignal],
+) -> list[OrgLead]:
     out: list[OrgLead] = []
-    for repo in _dedupe_by_org(repos.values()):
-        if cfg.skip_personal_accounts and not _is_org(cfg, repo.full_name.split("/")[0]):
+    total = len(deduped)
+    for i, repo in enumerate(deduped, 1):
+        print(f"      [{i}/{total}] resolving {repo.full_name} ...", flush=True)
+        try:
+            ol = await _try_org_lead(session, cfg, repo)
+        except Exception as e:
+            print(f"      ... error: {e}", flush=True)
             continue
-        champ = pick_champion(cfg, repo)
-        if champ:
-            out.append(OrgLead(
-                org_login=repo.full_name.split("/")[0],
-                repo=repo,
-                champion=champ,
-            ))
+        if ol:
+            print(f"      ... champion {ol.champion.email} ({ol.champion.login})", flush=True)
+            out.append(ol)
+        else:
+            print("      ... skipped (not an org / no public email on top contributors)", flush=True)
     return out
 
 
-# ---------------------------------------------------------------------------
-# Internals
-# ---------------------------------------------------------------------------
+async def _collect_parallel_async(
+    session: aiohttp.ClientSession, cfg: LeadGenConfig, deduped: list[RepoSignal],
+) -> list[OrgLead]:
+    total = len(deduped)
+    sem = asyncio.Semaphore(cfg.github_parallel_workers)
+    lock = asyncio.Lock()
+    done = 0
+
+    async def run_one(repo: RepoSignal) -> OrgLead | None:
+        nonlocal done
+        async with sem:
+            try:
+                ol = await _try_org_lead(session, cfg, repo)
+            except Exception as e:
+                async with lock:
+                    done += 1
+                    print(f"      [{done}/{total}] {repo.full_name} → error: {e}", flush=True)
+                return None
+            async with lock:
+                done += 1
+                if ol:
+                    print(
+                        f"      [{done}/{total}] {repo.full_name} → champion {ol.champion.email} "
+                        f"({ol.champion.login})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"      [{done}/{total}] {repo.full_name} → skipped "
+                        "(not an org / no public email on top contributors)",
+                        flush=True,
+                    )
+            return ol
+
+    results = await asyncio.gather(*(run_one(r) for r in deduped))
+    return [x for x in results if x is not None]
+
+
+async def collect_org_leads_async(cfg: LeadGenConfig) -> list[OrgLead]:
+    """Full stage 3: discovery + champion resolution with one aiohttp session."""
+    connector = make_aiohttp_connector(
+        limit=max(100, cfg.github_parallel_workers * 20),
+        limit_per_host=max(30, cfg.github_parallel_workers * 10),
+    )
+    async with aiohttp.ClientSession(connector=connector, headers=_headers(cfg)) as session:
+        repos: dict[str, RepoSignal] = {}
+
+        print("      discovery …", flush=True)
+        if "topic" in cfg.sources:
+            for topic in cfg.topics:
+                print(f"      topic search: {topic!r} …", flush=True)
+                n_before = len(repos)
+                for r in await search_by_topic(session, cfg, topic):
+                    repos.setdefault(r.full_name, r)
+                print(f"      … +{len(repos) - n_before} repos (cumulative {len(repos)} keys)", flush=True)
+
+        if "dependents" in cfg.sources:
+            for seed in cfg.dependents_of:
+                print(f"      dependents (code search): {seed!r} …", flush=True)
+                n_before = len(repos)
+                for r in await search_dependents_via_code(session, cfg, seed):
+                    repos.setdefault(r.full_name, r)
+                print(f"      … +{len(repos) - n_before} repos (cumulative {len(repos)} keys)", flush=True)
+
+        if "stargazers" in cfg.sources:
+            for seed in cfg.stargazers_of:
+                logins = await search_stargazers_seed(session, cfg, seed)
+                print(
+                    f"      stargazers: {seed!r} → {len(logins)} users to map to repos …",
+                    flush=True,
+                )
+                n_before = len(repos)
+                for j, login in enumerate(logins, 1):
+                    if cfg.verbose and j % 5 == 0:
+                        print(f"      … user {j}/{len(logins)}", flush=True)
+                    top = await _user_top_repo(session, cfg, login)
+                    if top:
+                        repos.setdefault(top.full_name, top)
+                print(f"      … +{len(repos) - n_before} repos (cumulative {len(repos)} keys)", flush=True)
+
+        deduped = list(_dedupe_by_org(repos.values()))
+        print(
+            f"      dedupe by owner: {len(repos)} repo keys → {len(deduped)} unique owners",
+            flush=True,
+        )
+        if not deduped:
+            return []
+
+        workers = cfg.github_parallel_workers
+        print(
+            f"      resolving champions ({len(deduped)} owners, "
+            f"{'sequential' if workers <= 1 else f'parallel aiohttp workers={workers}'}) …",
+            flush=True,
+        )
+
+        if workers <= 1:
+            return await _collect_sequential_async(session, cfg, deduped)
+        return await _collect_parallel_async(session, cfg, deduped)
+
+
+def collect_org_leads(cfg: LeadGenConfig) -> list[OrgLead]:
+    """Sync entrypoint for leadgen CLI (runs asyncio event loop)."""
+    return asyncio.run(collect_org_leads_async(cfg))
+
+
+# --- internals --------------------------------------------------------------
 
 
 def _repo_from(item: dict) -> RepoSignal:
@@ -267,7 +376,6 @@ def _repo_from(item: dict) -> RepoSignal:
 
 
 def _dedupe_by_org(repos: Iterable[RepoSignal]) -> list[RepoSignal]:
-    """Keep at most one repo per owning org — the one with the most stars."""
     best: dict[str, RepoSignal] = {}
     for r in repos:
         owner = r.full_name.split("/")[0]
@@ -276,32 +384,13 @@ def _dedupe_by_org(repos: Iterable[RepoSignal]) -> list[RepoSignal]:
     return list(best.values())
 
 
-def _user_top_repo(cfg: LeadGenConfig, login: str) -> RepoSignal | None:
-    try:
-        repos = _gh(cfg, f"/users/{login}/repos", sort="updated", per_page=10)
-    except Exception:
-        return None
-    if not isinstance(repos, list) or not repos:
-        return None
-    repos.sort(key=lambda r: int(r.get("stargazers_count") or 0), reverse=True)
-    return _repo_from(repos[0])
-
-
-def _is_org(cfg: LeadGenConfig, login: str) -> bool:
-    try:
-        u = _gh(cfg, f"/users/{login}")
-    except Exception:
-        return False
-    return u.get("type") == "Organization"
-
-
 def _recent_iso(days: int) -> str:
     from datetime import datetime, timedelta, timezone
+
     return (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
 
 
 def _guess_role(bio: str) -> str:
-    """Cheap heuristic; the LLM hook stage will refine using the same context."""
     bio_l = bio.lower()
     candidates = [
         ("cto", "CTO"), ("ceo", "CEO"), ("founder", "Founder"),
@@ -326,6 +415,7 @@ def _domain_from_blog(url: str) -> str:
         u = "https://" + u
     try:
         from urllib.parse import urlparse
+
         return urlparse(u).netloc.lower().lstrip("www.")
     except Exception:
         return ""

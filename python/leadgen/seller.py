@@ -10,12 +10,14 @@ downstream stages.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 
+import aiohttp
 from anthropic import Anthropic
 
-from .http import get_text
+from .http import aget_text, make_aiohttp_connector
 from .llm import json_completion
 
 
@@ -53,8 +55,16 @@ Output STRICT JSON matching this schema:
 No prose, no markdown, JSON only."""
 
 
+async def _fetch_html(url: str, user_agent: str, timeout_s: int) -> str:
+    connector = make_aiohttp_connector(limit=10, limit_per_host=5)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        return await aget_text(
+            session, url, headers={"User-Agent": user_agent}, timeout_s=timeout_s,
+        )
+
+
 def fetch_profile(client: Anthropic, *, model: str, url: str, user_agent: str, timeout_s: int) -> SellerProfile:
-    html = get_text(url, headers={"User-Agent": user_agent}, timeout_s=timeout_s)
+    html = asyncio.run(_fetch_html(url, user_agent, timeout_s))
     body = _strip_html(html)
     user = f"URL: {url}\n\nVisible page text:\n{body}"
     data = json_completion(client, model=model, system=_SYSTEM, user=user)
